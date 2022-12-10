@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app: stonesoup-pr-ratelimiter-controller
+  name: pipelinerun-rate-limiter-monitor
+  namespace: pipelinerun-rate-limiter
+spec:
+  endpoints:
+    - honorLabels: true
+      interval: 10s
+      port: http-metrics
+  jobLabel: app
+  namespaceSelector:
+    matchNames:
+      - pipelinerun-rate-limiter
+  selector:
+    matchLabels:
+      app: stonesoup-pr-ratelimiter-controller

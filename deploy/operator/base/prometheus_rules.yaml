@@ -1,0 +1,55 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    name: stonesoup-pipelinerun-alerts
+  name: stonesoup-pipelinerun-alerts
+  namespace: pipelinerun-rate-limiter
+spec:
+  groups:
+    - name: StonesoupPendingPipelineRuns
+      rules:
+        - alert: PendingPipelineRunsNotDecreasing
+          #TODO currently envision wanting alerts on a per namespace basis so customer X is told if his namespace is
+          # constrained; as such, we'd want a separate alert with ...stonesoup_pending_pipelineruns_2_total{namespace=XXX} ...
+          # where that alert is created as part of the customer's namespace getting provisioned on the service
+          expr: sum(stonesoup_pending_pipelineruns_2_total) >= sum(stonesoup_pending_pipelineruns_2_total offset 30m)
+          for: 2h
+          labels:
+            severity: info
+          annotations:
+            message: |
+              Stonesoup Pending PipelineRun operator is detecting that pending PipelineRuns are not decreasing for a
+              sustained amount of time.  Customers may want to consider purchasing more capacity so that their backlog
+              of pending work is scheduled in a more timely manner.
+              The list of namespaces pending, yet to be scheduled work:
+              {{ range query "stonesoup_pending_pipelineruns_2_total > 0" }}
+                {{ .Labels.namespace }}
+              {{ end }}
+        - alert: AbandonedPipelineRunsExist
+          expr: sum(stonesoup_abandoned_pipelineruns_2_total) >0
+          for: 2h
+          labels:
+            severity: info
+          annotations:
+            message: |
+              Stonesoup Pending PipelineRun operator is detecting that abandoned PipelineRuns exist.  This
+              condition could be a short term blip, and the customer may simple want to retry the work again.  But
+              it is also a sign to watch PipelineRun more close to see if additional capacity would help.
+              The list of namespaces abandoned work:
+              {{ range query "stonesoup_abandoned_pipelineruns_2_total > 0" }}
+                {{ .Labels.namespace }}
+              {{ end }}
+        - alert: AbandonedPipelineRunsIncreasing
+          expr: sum(stonesoup_abandoned_pipelineruns_2_total) > sum(stonesoup_abandoned_pipelineruns_2_total offset 30m)
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            message: |
+              Stonesoup Pending PipelineRun operator is detecting that abandoned PipelineRuns not only exist, but are increasing
+              over a non-trivial amount of time.  The customer should see if additional capacity would help.
+              The list of namespaces abandoned work:
+              {{ range query "stonesoup_abandoned_pipelineruns_2_total > 0" }}
+                {{ .Labels.namespace }}
+              {{ end }}

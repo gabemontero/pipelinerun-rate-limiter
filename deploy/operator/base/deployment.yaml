@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stonesoup-pr-ratelimiter-controller
+  namespace: pipelinerun-rate-limiter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stonesoup-pr-ratelimiter-controller
+  template:
+    metadata:
+      labels:
+        app: stonesoup-pr-ratelimiter-controller
+    spec:
+      containers:
+        - name: stonesoup-pr-ratelimiter-controller
+          image: stonesoup-pr-ratelimiter-controller
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http-metrics
+          args:
+            - "--v=6"
+            - "--zap-log-level=6"
+            - "--zap-devel=true"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+      serviceAccountName: stonesoup-pr-ratelimiter-controller

@@ -13,3 +13,40 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# copy from jvm-build-service, but filter out some obvious java stuff
+.DS_Store
+target
+*.iml
+.idea
+.settings
+.project
+.vscode/
+*~
+local-test
+out
+lib
+bin
+.directory
+hs_err_pid*.log
+dumps
+*.orig
+*.rej
+.factorypath
+graph-output.dot
+*.swp
+*.swo
+ObjectStore
+docker/distroless/bazel-*
+/.apt_generated_tests/
+replay_*.logß
+nbactions.xml
+nb-configuration.xml
+.cache
+/lsp/
+.envrc
+*.out
+
+# Kustomize overlays for development, openshift ci
+deploy/**/development/**
+deploy/**/ci-final/**
