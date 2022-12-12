@@ -118,7 +118,12 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 	}
 
 	if hardPodCount > 0 {
-		ret, lerr := PipelineRunStats(ctx, r.client, pr.Namespace)
+		prList := v1beta1.PipelineRunList{}
+		opts := &client.ListOptions{Namespace: pr.Namespace}
+		if err := r.client.List(ctx, &prList, opts); err != nil {
+			return reconcile.Result{}, err
+		}
+		ret, lerr := PipelineRunStats(&prList)
 		if lerr != nil {
 			return reconcile.Result{}, lerr
 		}
@@ -185,14 +190,8 @@ type Counts struct {
 	TotalCount     int
 }
 
-func PipelineRunStats(ctx context.Context, c client.Client, namespace string) (map[string]Counts, error) {
+func PipelineRunStats(prList *v1beta1.PipelineRunList) (map[string]Counts, error) {
 	var err error
-	prList := v1beta1.PipelineRunList{}
-	opts := &client.ListOptions{Namespace: namespace}
-	if err = c.List(ctx, &prList, opts); err != nil {
-		return map[string]Counts{}, err
-	}
-
 	ret := map[string]Counts{}
 	for _, p := range prList.Items {
 		ct, ok := ret[p.Namespace]

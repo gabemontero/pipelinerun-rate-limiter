@@ -75,7 +75,7 @@ func TestServiceRegistry(t *testing.T) {
 	var ok bool
 	ta.maven, ok = obj.(*v1beta1.Task)
 	if !ok {
-		debugAndFailTest(ta, fmt.Sprintf("file %s did not produce a task: %#v", mavenYamlPath, obj))
+		debugAndFailTest(ta, fmt.Sprintf("file https://raw.githubusercontent.com/redhat-appstudio/jvm-build-service/main/deploy/base/maven-v0.2.yaml did not produce a task: %#v", obj))
 	}
 	// override images if need be
 	analyserImage := os.Getenv("JVM_BUILD_SERVICE_REQPROCESSOR_IMAGE")
@@ -96,15 +96,15 @@ func TestServiceRegistry(t *testing.T) {
 
 	resp2, err3 := httpClient.Get("https://raw.githubusercontent.com/redhat-appstudio/jvm-build-service/main/hack/examples/pipeline.yaml")
 	defer resp2.Body.Close()
-	httpBytes, err = ioutil.ReadAll(resp2)
-	if err != nil {
-		debugAndFailTest(ta, err.Error())
+	httpBytes, err = ioutil.ReadAll(resp2.Body)
+	if err3 != nil {
+		debugAndFailTest(ta, err3.Error())
 	}
 	ta.pipeline = &v1beta1.Pipeline{}
 	obj = decodeBytesToTektonObjbytes(httpBytes, ta.pipeline, ta)
 	ta.pipeline, ok = obj.(*v1beta1.Pipeline)
 	if !ok {
-		debugAndFailTest(ta, fmt.Sprintf("file %s did not produce a pipeline: %#v", pipelineYamlPath, obj))
+		debugAndFailTest(ta, fmt.Sprintf("file https://raw.githubusercontent.com/redhat-appstudio/jvm-build-service/main/hack/examples/pipeline.yaml did not produce a pipeline: %#v", obj))
 	}
 	ta.pipeline, err = tektonClient.TektonV1beta1().Pipelines(ta.ns).Create(context.TODO(), ta.pipeline, metav1.CreateOptions{})
 	if err != nil {
@@ -113,15 +113,15 @@ func TestServiceRegistry(t *testing.T) {
 
 	resp3, err4 := httpClient.Get("https://raw.githubusercontent.com/redhat-appstudio/jvm-build-service/main/hack/examples/run-service-registry.yaml")
 	defer resp3.Body.Close()
-	httpBytes, err = ioutil.ReadAll(resp3)
-	if err != nil {
-		debugAndFailTest(ta, err.Error())
+	httpBytes, err = ioutil.ReadAll(resp3.Body)
+	if err4 != nil {
+		debugAndFailTest(ta, err4.Error())
 	}
 	ta.run = &v1beta1.PipelineRun{}
 	obj = decodeBytesToTektonObjbytes(httpBytes, ta.run, ta)
 	ta.run, ok = obj.(*v1beta1.PipelineRun)
 	if !ok {
-		debugAndFailTest(ta, fmt.Sprintf("file %s did not produce a pipelinerun: %#v", runYamlPath, obj))
+		debugAndFailTest(ta, fmt.Sprintf("file https://raw.githubusercontent.com/redhat-appstudio/jvm-build-service/main/hack/examples/run-service-registry.yaml did not produce a pipelinerun: %#v", obj))
 	}
 	ta.run, err = tektonClient.TektonV1beta1().PipelineRuns(ta.ns).Create(context.TODO(), ta.run, metav1.CreateOptions{})
 	if err != nil {
@@ -161,9 +161,13 @@ func TestServiceRegistry(t *testing.T) {
 
 	validationOccurred := false
 	ta.t.Run("maintain pipelinerun quota", func(t *testing.T) {
-		perr = wait.PollImmediate(1*time.Hour, 1*time.Minute, func() (done bool, err error) {
+		wait.PollImmediate(1*time.Minute, 15*time.Minute, func() (done bool, err error) {
 			ctx := context.TODO()
-			stats, serr := pendingpipelinerun.PipelineRunStats(ctx, tektonClient, ta.ns)
+			prList, lerr := tektonClient.TektonV1beta1().PipelineRuns(ta.ns).List(ctx, metav1.ListOptions{})
+			if lerr != nil {
+				return false, nil
+			}
+			stats, serr := pendingpipelinerun.PipelineRunStats(prList)
 			if serr != nil {
 				ta.Logf(fmt.Sprintf("get stats produced err: %s", serr.Error()))
 				return false, nil
@@ -176,6 +180,8 @@ func TestServiceRegistry(t *testing.T) {
 				debugAndFailTest(ta, fmt.Sprintf("50 or more active pipelineruns: %#v", stat))
 			}
 			validationOccurred = true
+			ta.Logf(fmt.Sprintf("we have %d active pipeline runs", stat.ActiveCount))
+			return false, nil
 		})
 
 	})
