@@ -2,6 +2,7 @@ package pendingpipelinerun
 
 import (
 	"context"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -75,7 +76,13 @@ func (sc *statsCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (sc *statsCollector) Collect(ch chan<- prometheus.Metric) {
-	cts, err := PipelineRunStats(context.Background(), sc.client, metav1.NamespaceAll)
+	prList := v1beta1.PipelineRunList{}
+	opts := &client.ListOptions{Namespace: metav1.NamespaceAll}
+	if err := sc.client.List(context.Background(), &prList, opts); err != nil {
+		//TODO add log / event
+		return
+	}
+	cts, err := PipelineRunStats(&prList)
 	if err != nil {
 		//TODO add log / event
 		return
