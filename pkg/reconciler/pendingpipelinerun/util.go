@@ -22,6 +22,41 @@ func MutatePipelineRun(run *v1beta1.PipelineRun) *v1beta1.PipelineRun {
 	return run
 }
 
+func getHardLimits(ctx context.Context, cl client.Client, namespace string) (int, int, error) {
+	quotaList := corev1.ResourceQuotaList{}
+	err := cl.List(ctx, &quotaList)
+	if err != nil {
+		return 0, 0, err
+	}
+	cpuLimit := 0
+	memLimit := 0
+	for _, quota := range quotaList.Items {
+		if quota.Namespace != namespace {
+			continue
+		}
+		nonTerminating := false
+		for _, scope := range quota.Spec.Scopes {
+			if scope == corev1.ResourceQuotaScopeNotTerminating {
+				nonTerminating = true
+				break
+			}
+		}
+		if !nonTerminating {
+			continue
+		}
+		if quota.Spec.Hard.Name("limits.cpu", resource.DecimalSI) != nil {
+			cpuLimit = int(quota.Spec.Hard.Name("limits.cpu", resource.DecimalSI).Value())
+		}
+		if quota.Spec.Hard.Name("limits.memory", resource.DecimalSI) != nil {
+			memLimit = int(quota.Spec.Hard.Name("limits.memory", resource.DecimalSI).Value())
+		}
+		if cpuLimit > 0 && memLimit > 0 {
+			break
+		}
+	}
+	return cpuLimit, memLimit, nil
+}
+
 func getHardPodCount(ctx context.Context, cl client.Client, namespace string) (int, error) {
 	// this should be nil in kcp
 	if clusterresourcequota.QuotaClient != nil {

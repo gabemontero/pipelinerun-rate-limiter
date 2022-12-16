@@ -35,6 +35,19 @@ rules:
       - patch
       - update
       - watch
+
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - podnodemetrics
+      - pods
+      - nodemetrics
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+
   - apiGroups:
       - ''
       - events.k8s.io
@@ -56,6 +69,7 @@ rules:
       - ""
     resources:
       - resourcequotas
+      - nodes
     verbs:
       - get
       - list

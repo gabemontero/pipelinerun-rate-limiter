@@ -6,10 +6,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gabemontero/pipelinerun-rate-limiter/pkg/reconciler/podnodemetrics"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,17 +41,50 @@ var (
 )
 
 type ReconcilePendingPipelineRun struct {
-	client        client.Client
-	scheme        *runtime.Scheme
-	eventRecorder record.EventRecorder
+	client              client.Client
+	scheme              *runtime.Scheme
+	eventRecorder       record.EventRecorder
+	allocatableCPU      map[string]resource.Quantity
+	allocatableMem      map[string]resource.Quantity
+	totalAllocatableCPU resource.Quantity
+	totalAllocatableMem resource.Quantity
 }
 
 func newPRReconciler(mgr ctrl.Manager) reconcile.Reconciler {
-	return &ReconcilePendingPipelineRun{
-		client:        mgr.GetClient(),
-		scheme:        mgr.GetScheme(),
-		eventRecorder: mgr.GetEventRecorderFor("PendingPipelineRun"),
+	rc := &ReconcilePendingPipelineRun{
+		client:              mgr.GetClient(),
+		scheme:              mgr.GetScheme(),
+		eventRecorder:       mgr.GetEventRecorderFor("PendingPipelineRun"),
+		allocatableMem:      map[string]resource.Quantity{},
+		allocatableCPU:      map[string]resource.Quantity{},
+		totalAllocatableCPU: resource.Quantity{},
+		totalAllocatableMem: resource.Quantity{},
 	}
+	nodeList := &corev1.NodeList{}
+	//TODO retry on error / poll
+	ctx := context.Background()
+	rc.client.List(ctx, nodeList)
+	for _, node := range nodeList.Items {
+		// could also check master vs. worker labels
+		// if has schedule taint, skip
+		if len(node.Spec.Taints) > 0 {
+			continue
+		}
+		for key, val := range node.Status.Allocatable {
+			switch key {
+			case corev1.ResourceCPU:
+				rc.allocatableCPU[node.Name] = val
+				rc.totalAllocatableCPU.Add(val)
+				log.Info(fmt.Sprintf("GGM node %s has %s cpu", node.Name, val.String()))
+			case corev1.ResourceMemory:
+				rc.allocatableMem[node.Name] = val
+				rc.totalAllocatableMem.Add(val)
+				log.Info(fmt.Sprintf("GGM node %s has %s mem", node.Name, val.String()))
+			}
+		}
+	}
+	log.Info(fmt.Sprintf("GGM cluster has %s cpu and %s mem", rc.totalAllocatableCPU.String(), rc.totalAllocatableMem.String()))
+	return rc
 }
 
 func (r *ReconcilePendingPipelineRun) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
@@ -115,6 +151,131 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 	hardPodCount, pcerr := getHardPodCount(ctx, r.client, pr.Namespace)
 	if pcerr != nil {
 		return reconcile.Result{}, pcerr
+	}
+
+	/*
+			using the controller runtime client for the metric list resulted in
+			I1213 19:01:42.019450       1 reflector.go:255] Listing and watching *metrics.PodMetrics from sigs.k8s.io/controller-runtime/pkg/cache/internal/informers_map.go:277
+			I1213 19:01:42.019635       1 request.go:914] Error in request: v1.ListOptions is not suitable for converting to "metrics.k8s.io/__internal" in scheme "pkg/controller/controller.go:49"
+			W1213 19:01:42.019735       1 reflector.go:324] sigs.k8s.io/controller-runtime/pkg/cache/internal/informers_map.go:277: failed to list *metrics.PodMetrics: v1.ListOptions is not suitable for converting to "metrics.k8s.io/__internal" in scheme "pkg/controller/controller.go:49"
+			E1213 19:01:42.019811       1 reflector.go:138] sigs.k8s.io/controller-runtime/pkg/cache/internal/informers_map.go:277: Failed to watch *metrics.PodMetrics: failed to list *metrics.PodMetrics: v1.ListOptions is not suitable for converting to "metrics.k8s.io/__internal" in scheme "pkg/controller/controller.go:49"
+
+
+		    E1213 19:25:43.223373       1 reflector.go:138] sigs.k8s.io/controller-runtime/pkg/cache/internal/informers_map.go:277: Failed to watch *v1beta1.PodMetrics: the server does not allow this method on the requested resource (get pods.metrics.k8s.io)
+	*/
+	if podnodemetrics.K8SMetricsClient != nil {
+		namespaceCPU := resource.Quantity{}
+		namespaceMem := resource.Quantity{}
+		allNodesOverCPU := true
+		allNodesOverMem := true
+		podMetrics, err := podnodemetrics.K8SMetricsClient.MetricsV1beta1().PodMetricses(pr.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			log.Info(fmt.Sprintf("GGM pod metrics for ns %s err: %s ", pr.Namespace, err.Error()))
+		} else {
+			for _, pm := range podMetrics.Items {
+				for _, cm := range pm.Containers {
+					for key, val := range cm.Usage {
+						switch key {
+						case corev1.ResourceCPU:
+							namespaceCPU.Add(val)
+						case corev1.ResourceMemory:
+							namespaceMem.Add(val)
+						}
+					}
+				}
+			}
+			//log.Info(fmt.Sprintf("GGM ns %s with %d pods has total cpu usage %s and total mem usage %s", pr.Namespace, len(podMetrics.Items), namespaceCPU.String(), namespaceMem.String()))
+		}
+		nodeList := map[string]string{}
+		podList := &corev1.PodList{}
+		err = r.client.List(ctx, podList, &client.ListOptions{Namespace: pr.Namespace})
+		if err != nil {
+			log.Info(fmt.Sprintf("GGM pod list err %s", err.Error()))
+		}
+		for _, pod := range podList.Items {
+			if len(pod.Spec.NodeName) == 0 {
+				continue
+			}
+			nodeList[pod.Spec.NodeName] = ""
+		}
+		nodeMetrics, err := podnodemetrics.K8SMetricsClient.MetricsV1beta1().NodeMetricses().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			log.Info(fmt.Sprintf("GGM node metrics err: %s", err.Error()))
+		} else {
+			for _, nm := range nodeMetrics.Items {
+				_, ok := nodeList[nm.Name]
+				if !ok {
+					continue
+				}
+				nodeCurrentCPU := resource.Quantity{}
+				nodeCurrentMem := resource.Quantity{}
+
+				for key, val := range nm.Usage {
+					switch key {
+					case corev1.ResourceCPU:
+						nodeCurrentCPU = val
+					case corev1.ResourceMemory:
+						nodeCurrentMem = val
+					}
+				}
+				nodeAvailMem := r.allocatableMem[nm.Name]
+				nodeAvailCPU := r.allocatableCPU[nm.Name]
+				allocMemFraction := float64(nodeCurrentMem.MilliValue()) / float64(nodeAvailMem.MilliValue())
+				allocCpuFraction := float64(nodeCurrentCPU.MilliValue()) / float64(nodeAvailCPU.MilliValue())
+				log.Info(fmt.Sprintf("GGM node %s curr cpu %s curr mem %s curr cpu ratio %.2f curr mem ratio %.2f",
+					nm.Name,
+					nodeCurrentCPU.String(),
+					nodeCurrentMem.String(),
+					allocCpuFraction,
+					allocMemFraction))
+				if allocCpuFraction <= 0.50 {
+					allNodesOverCPU = false
+				}
+				if allocMemFraction <= 0.50 {
+					allNodesOverMem = false
+				}
+			}
+		}
+		//nsMemFraction := float64(namespaceMem.MilliValue()) / float64(r.totalAllocatableMem.MilliValue())
+		//nsCPUFraction := float64(namespaceCPU.MilliValue()) / float64(r.totalAllocatableCPU.MilliValue())
+		//log.Info(fmt.Sprintf("GGM ns %s uses %.2f of total cpu and %.2f of total mem", pr.Namespace, nsCPUFraction, nsMemFraction))
+
+		if allNodesOverCPU {
+			log.Info(fmt.Sprintf("GGMGGM thorttling %s because of cluster cpu", pr.Name))
+			// see if pending item still has to wait
+			if !r.timedOut(pr) {
+				return reconcile.Result{RequeueAfter: requeueAfter}, nil
+			}
+			// pending item has waited too long, cancel with an event to explain
+			pr.Spec.Status = v1beta1.PipelineRunSpecStatusCancelled
+			if pr.Annotations == nil {
+				pr.Annotations = map[string]string{}
+			}
+			pr.Annotations[AbandonedAnnotation] = "true"
+			r.eventRecorder.Eventf(pr, corev1.EventTypeWarning, "AbandonedPipelineRun", "after throttling, now past throttling timeout and have to abandon %s:%s", pr.Namespace, pr.Name)
+			return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
+		}
+
+		if allNodesOverMem {
+			log.Info(fmt.Sprintf("GGMGGM throttling %s because of cluster mem", pr.Name))
+			// see if pending item still has to wait
+			if !r.timedOut(pr) {
+				return reconcile.Result{RequeueAfter: requeueAfter}, nil
+			}
+			// pending item has waited too long, cancel with an event to explain
+			pr.Spec.Status = v1beta1.PipelineRunSpecStatusCancelled
+			if pr.Annotations == nil {
+				pr.Annotations = map[string]string{}
+			}
+			pr.Annotations[AbandonedAnnotation] = "true"
+			r.eventRecorder.Eventf(pr, corev1.EventTypeWarning, "AbandonedPipelineRun", "after throttling, now past throttling timeout and have to abandon %s:%s", pr.Namespace, pr.Name)
+			return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
+
+		}
+		log.Info(fmt.Sprintf("GGMGGM unthrottling %s", pr.Name))
+		// remove pending bit, make this one active
+		pr.Spec.Status = ""
+		return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
 	}
 
 	if hardPodCount > 0 {
