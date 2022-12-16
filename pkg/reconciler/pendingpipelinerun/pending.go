@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -104,7 +105,7 @@ func (r *ReconcilePendingPipelineRun) Reconcile(ctx context.Context, request rec
 	if prerr != nil {
 		msg := fmt.Sprintf("Reconcile key %s received not found errors for both pipelineruns and pendingpipelinerun (probably deleted)\"", request.NamespacedName.String())
 		log.Info(msg)
-		return reconcile.Result{}, client.IgnoreNotFound(r.unthrottleNextOnQueuePlusCleanup(ctx, pr.Namespace))
+		return reconcile.Result{}, client.IgnoreNotFound(r.unthrottleNextOnQueuePlusCleanup(ctx, types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}))
 	}
 
 	if pr.IsPending() {
@@ -117,7 +118,7 @@ func (r *ReconcilePendingPipelineRun) Reconcile(ctx context.Context, request rec
 
 	if pr.IsDone() || pr.IsCancelled() || pr.IsGracefullyCancelled() || pr.IsGracefullyStopped() {
 		// terminal state, pop a pending item off the queue
-		return reconcile.Result{}, client.IgnoreNotFound(r.unthrottleNextOnQueuePlusCleanup(ctx, pr.Namespace))
+		return reconcile.Result{}, client.IgnoreNotFound(r.unthrottleNextOnQueuePlusCleanup(ctx, types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}))
 	}
 
 	return reconcile.Result{}, nil
@@ -152,6 +153,16 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 	if pcerr != nil {
 		return reconcile.Result{}, pcerr
 	}
+	prList := v1beta1.PipelineRunList{}
+	opts := &client.ListOptions{Namespace: pr.Namespace}
+	if err := r.client.List(ctx, &prList, opts); err != nil {
+		return reconcile.Result{}, err
+	}
+	ret, lerr := PipelineRunStats(&prList)
+	if lerr != nil {
+		return reconcile.Result{}, lerr
+	}
+	cts, _ := ret[pr.Namespace]
 
 	/*
 			using the controller runtime client for the metric list resulted in
@@ -166,6 +177,8 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 	if podnodemetrics.K8SMetricsClient != nil {
 		namespaceCPU := resource.Quantity{}
 		namespaceMem := resource.Quantity{}
+		clusterCPU := resource.Quantity{}
+		clusterMem := resource.Quantity{}
 		allNodesOverCPU := true
 		allNodesOverMem := true
 		podMetrics, err := podnodemetrics.K8SMetricsClient.MetricsV1beta1().PodMetricses(pr.Namespace).List(ctx, metav1.ListOptions{})
@@ -184,29 +197,21 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 					}
 				}
 			}
-			//log.Info(fmt.Sprintf("GGM ns %s with %d pods has total cpu usage %s and total mem usage %s", pr.Namespace, len(podMetrics.Items), namespaceCPU.String(), namespaceMem.String()))
-		}
-		nodeList := map[string]string{}
-		podList := &corev1.PodList{}
-		err = r.client.List(ctx, podList, &client.ListOptions{Namespace: pr.Namespace})
-		if err != nil {
-			log.Info(fmt.Sprintf("GGM pod list err %s", err.Error()))
-		}
-		for _, pod := range podList.Items {
-			if len(pod.Spec.NodeName) == 0 {
-				continue
+			if len(podMetrics.Items) > 20 {
+				log.Info(fmt.Sprintf("GGM ns %s with %d pods has total cpu usage %s and total mem usage %s", pr.Namespace, len(podMetrics.Items), namespaceCPU.String(), namespaceMem.String()))
 			}
-			nodeList[pod.Spec.NodeName] = ""
 		}
+		//log.Info(fmt.Sprintf("GGM active PRs %d pod metrics %d for ns %s", cts.ActiveCount, len(podMetrics.Items), pr.Namespace))
 		nodeMetrics, err := podnodemetrics.K8SMetricsClient.MetricsV1beta1().NodeMetricses().List(ctx, metav1.ListOptions{})
 		if err != nil {
 			log.Info(fmt.Sprintf("GGM node metrics err: %s", err.Error()))
 		} else {
 			for _, nm := range nodeMetrics.Items {
-				_, ok := nodeList[nm.Name]
+				_, ok := r.allocatableCPU[nm.Name]
 				if !ok {
 					continue
 				}
+				//GGM timestamp useless, same as time.Now, Window consistently a 1m0x Duration
 				nodeCurrentCPU := resource.Quantity{}
 				nodeCurrentMem := resource.Quantity{}
 
@@ -218,20 +223,22 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 						nodeCurrentMem = val
 					}
 				}
+				clusterCPU.Add(nodeCurrentCPU)
+				clusterMem.Add(nodeCurrentMem)
 				nodeAvailMem := r.allocatableMem[nm.Name]
 				nodeAvailCPU := r.allocatableCPU[nm.Name]
 				allocMemFraction := float64(nodeCurrentMem.MilliValue()) / float64(nodeAvailMem.MilliValue())
 				allocCpuFraction := float64(nodeCurrentCPU.MilliValue()) / float64(nodeAvailCPU.MilliValue())
-				log.Info(fmt.Sprintf("GGM node %s curr cpu %s curr mem %s curr cpu ratio %.2f curr mem ratio %.2f",
-					nm.Name,
-					nodeCurrentCPU.String(),
-					nodeCurrentMem.String(),
-					allocCpuFraction,
-					allocMemFraction))
-				if allocCpuFraction <= 0.50 {
+				//log.Info(fmt.Sprintf("GGM node %s curr cpu %s curr mem %s curr cpu ratio %.2f curr mem ratio %.2f",
+				//	nm.Name,
+				//	nodeCurrentCPU.String(),
+				//	nodeCurrentMem.String(),
+				//	allocCpuFraction,
+				//	allocMemFraction))
+				if allocCpuFraction <= 0.70 {
 					allNodesOverCPU = false
 				}
-				if allocMemFraction <= 0.50 {
+				if allocMemFraction <= 0.70 {
 					allNodesOverMem = false
 				}
 			}
@@ -242,36 +249,57 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 
 		if allNodesOverCPU {
 			log.Info(fmt.Sprintf("GGMGGM thorttling %s because of cluster cpu", pr.Name))
-			// see if pending item still has to wait
-			if !r.timedOut(pr) {
-				return reconcile.Result{RequeueAfter: requeueAfter}, nil
-			}
-			// pending item has waited too long, cancel with an event to explain
-			pr.Spec.Status = v1beta1.PipelineRunSpecStatusCancelled
-			if pr.Annotations == nil {
-				pr.Annotations = map[string]string{}
-			}
-			pr.Annotations[AbandonedAnnotation] = "true"
-			r.eventRecorder.Eventf(pr, corev1.EventTypeWarning, "AbandonedPipelineRun", "after throttling, now past throttling timeout and have to abandon %s:%s", pr.Namespace, pr.Name)
-			return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
+			return r.throttle(ctx, pr)
 		}
 
 		if allNodesOverMem {
 			log.Info(fmt.Sprintf("GGMGGM throttling %s because of cluster mem", pr.Name))
-			// see if pending item still has to wait
-			if !r.timedOut(pr) {
-				return reconcile.Result{RequeueAfter: requeueAfter}, nil
-			}
-			// pending item has waited too long, cancel with an event to explain
-			pr.Spec.Status = v1beta1.PipelineRunSpecStatusCancelled
-			if pr.Annotations == nil {
-				pr.Annotations = map[string]string{}
-			}
-			pr.Annotations[AbandonedAnnotation] = "true"
-			r.eventRecorder.Eventf(pr, corev1.EventTypeWarning, "AbandonedPipelineRun", "after throttling, now past throttling timeout and have to abandon %s:%s", pr.Namespace, pr.Name)
-			return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
-
+			return r.throttle(ctx, pr)
 		}
+
+		if hardPodCount > 0 {
+			switch {
+			case (cts.TotalCount - cts.DoneCount) < hardPodCount:
+				// below hard pod count quota so remove PR pending
+				break
+			case cts.TotalCount == cts.PendingCount:
+				// initial race condition possible if controller starts a bunch before we get events:
+				break
+			case (hardPodCount - quotaBuffer) <= cts.ActiveCount:
+				return r.throttle(ctx, pr)
+			}
+		}
+
+		//TODO GGM based on analysis of builds during periodic
+		maxStepCPU := resource.MustParse("3000m")
+		maxStepMem := resource.MustParse("3Gi")
+
+		//TODO the myriad of ways to inject into a PipelineRun including bundles ?? for now, this works off of how jvm-build-servivce does it
+		if pr.Spec.PipelineSpec != nil {
+			spec := pr.Spec.PipelineSpec
+			for _, task := range spec.Tasks {
+				if task.TaskSpec != nil {
+					for _, step := range task.TaskSpec.Steps {
+						cpu := step.Resources.Limits.Cpu()
+						mem := step.Resources.Limits.Memory()
+						log.Info(fmt.Sprintf("GGM pr %s step %s has cpu %v", pr.Name, step.Name, cpu))
+						if cpu != nil && cpu.MilliValue() > maxStepCPU.MilliValue() {
+							maxStepCPU = *cpu
+						}
+						if mem != nil && mem.MilliValue() > maxStepMem.MilliValue() {
+							maxStepMem = *mem
+						}
+					}
+				}
+			}
+			enoughSpace := r.totalAllocatableCPU.MilliValue()-clusterCPU.MilliValue() >= maxStepCPU.MilliValue()
+			log.Info(fmt.Sprintf("GGM cluster current cpu %d cluster avail cpu %d pr cpu need %d will fit %v", clusterCPU.MilliValue(), r.totalAllocatableCPU.MilliValue(), maxStepCPU.MilliValue(), enoughSpace))
+			if !enoughSpace {
+				log.Info(fmt.Sprintf("GGM throttling %s because of pr specific capacity", pr.Name))
+				return r.throttle(ctx, pr)
+			}
+		}
+
 		log.Info(fmt.Sprintf("GGMGGM unthrottling %s", pr.Name))
 		// remove pending bit, make this one active
 		pr.Spec.Status = ""
@@ -279,17 +307,6 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 	}
 
 	if hardPodCount > 0 {
-		prList := v1beta1.PipelineRunList{}
-		opts := &client.ListOptions{Namespace: pr.Namespace}
-		if err := r.client.List(ctx, &prList, opts); err != nil {
-			return reconcile.Result{}, err
-		}
-		ret, lerr := PipelineRunStats(&prList)
-		if lerr != nil {
-			return reconcile.Result{}, lerr
-		}
-		cts, _ := ret[pr.Namespace]
-
 		switch {
 		case (cts.TotalCount - cts.DoneCount) < hardPodCount:
 			// below hard pod count quota so remove PR pending
@@ -298,18 +315,7 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 			// initial race condition possible if controller starts a bunch before we get events:
 			break
 		case (hardPodCount - quotaBuffer) <= cts.ActiveCount:
-			// see if pending item still has to wait
-			if !r.timedOut(pr) {
-				return reconcile.Result{RequeueAfter: requeueAfter}, nil
-			}
-			// pending item has waited too long, cancel with an event to explain
-			pr.Spec.Status = v1beta1.PipelineRunSpecStatusCancelled
-			if pr.Annotations == nil {
-				pr.Annotations = map[string]string{}
-			}
-			pr.Annotations[AbandonedAnnotation] = "true"
-			r.eventRecorder.Eventf(pr, corev1.EventTypeWarning, "AbandonedPipelineRun", "after throttling, now past throttling timeout and have to abandon %s:%s", pr.Namespace, pr.Name)
-			return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
+			return r.throttle(ctx, pr)
 		}
 	}
 
@@ -318,10 +324,25 @@ func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1b
 	return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
 }
 
-func (r *ReconcilePendingPipelineRun) unthrottleNextOnQueuePlusCleanup(ctx context.Context, namespace string) error {
+func (r *ReconcilePendingPipelineRun) throttle(ctx context.Context, pr *v1beta1.PipelineRun) (reconcile.Result, error) {
+	// see if pending item still has to wait
+	if !r.timedOut(pr) {
+		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+	}
+	// pending item has waited too long, cancel with an event to explain
+	pr.Spec.Status = v1beta1.PipelineRunSpecStatusCancelled
+	if pr.Annotations == nil {
+		pr.Annotations = map[string]string{}
+	}
+	pr.Annotations[AbandonedAnnotation] = "true"
+	r.eventRecorder.Eventf(pr, corev1.EventTypeWarning, "AbandonedPipelineRun", "after throttling, now past throttling timeout and have to abandon %s:%s", pr.Namespace, pr.Name)
+	return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
+}
+
+func (r *ReconcilePendingPipelineRun) unthrottleNextOnQueuePlusCleanup(ctx context.Context, nsName types.NamespacedName) error {
 	var err error
 	prList := v1beta1.PipelineRunList{}
-	opts := &client.ListOptions{Namespace: namespace}
+	opts := &client.ListOptions{Namespace: nsName.Namespace}
 	if err = r.client.List(ctx, &prList, opts); err != nil {
 		return err
 	}
