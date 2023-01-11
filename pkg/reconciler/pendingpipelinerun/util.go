@@ -60,7 +60,9 @@ func getHardPodCount(ctx context.Context, cl client.Client, namespace string) (i
 				break
 			}
 		}
-		return hardPodCount, nil
+		if hardPodCount > 0 {
+			return hardPodCount, nil
+		}
 	}
 	quotaList := corev1.ResourceQuotaList{}
 	err := cl.List(ctx, &quotaList)
